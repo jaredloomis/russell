@@ -1,119 +1,176 @@
+{-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE DeriveFunctor #-}
 {-# LANGUAGE TupleSections #-}
 module Parser where
 
-import Control.Monad (void, when)
-import Data.Functor.Identity (runIdentity)
-import Control.Applicative hiding (Const, (<|>), many)
+import Data.List
 import Data.Monoid (Monoid(..))
-import Data.List (foldl1')
-import Control.Monad.State (State, get, put, evalStateT)
-import Debug.Trace (trace)
+import Control.Applicative hiding ((<|>), many)
+import Data.Functor.Identity (runIdentity)
+import Control.Monad.State
+import Text.PrettyPrint.HughesPJClass (Pretty(..))
 
 import Text.Parsec hiding (State)
 import Text.Parsec.Pos (initialPos)
-import Text.Parsec.String
 import qualified Text.Parsec.Token as Tok
-import Text.Parsec.Language (haskellStyle, emptyDef)
+import Text.Parsec.Language (emptyDef)
 
-import Expr (Const(..), Binder(..), Expr(..), Name(..),
-             ConstTy(..), NameType(..), typeWith)
-import Decl
+import qualified Data.Map as M
 
-{-
-data PExpr n =
-    PCore (Expr n)
-  | PPar n
-  | PTyped (PExpr n) (PExpr n)
-  | PApp (PExpr n) (PExpr n)
-  | PBind n (Binder (PExpr n)) (PExpr n)
-  | PConst !Const
-  | PTypeE !Int
+import Term
+import Tactic
+
+data PTerm n =
+    PPar n
+  | PApp (PTerm n) (PTerm n)
+  | PBind n (Binder (PTerm n)) (PTerm n)
+  | PConstant !Constant
   | PTypeI
-  | PHole
+  | PTypeE !Int
   deriving (Show, Eq, Functor)
--}
 
-{- TODO XXX: Implicit Args / Holes
--- id : {A : Type} -> A -> A
--- id = \a => a
---
--- test : Int
--- test = id _ 12
---
--- test = App (App 'id' Hole) 12
---
--- - App f _ : Int
---       |
--- -     f : 
-
--- term -> type -> term
-fillHoles :: [(Name, Expr Name)] ->
-             Expr Name -> Expr Name ->
-             Either String (Expr Name)
-fillHoles ctx (App f (Par Ref UName)) fxTy =
-    let fTy = typeWith ctx f
-    in case fTy of
-        Left _  -> fTy
-        Right (Bind n (Pi holeTy) body) ->
-            
-
--- term -> type -> type
-unify :: PExpr Name -> PExpr Name -> PExpr Name
-unify (PBind n (Lam ty) )
-unify (PPar n) (PPar m)
--}
-{-
-    let fTy = typeWith ctx f
-    in undefined
--}
-{-
-fillHoles ctx (App f x) fxTy =
-    PApp
-        (fillHoles f (PBind UName (Pi ty) fxTy))
-        (fillHoles x ty)
--}
-
-{-
-fillHoles :: PExpr Name -> PExpr Name -> Either String (PExpr Name)
-fillHoles (PCore _) _ = Left "fillHoles: PCore 1"
-fillHoles _ (PCore _) = Left "fillHoles: PCore 2"
-fillHoles p@PPar{} ty = Right $ PTyped p ty
-fillHoles (PTyped expr ty) = 
--}
-{-
-parsedToCore :: PExpr Name -> Expr Name
-parsedToCore (PCore c) = c
-parsedToCore (PPar n) =
-    Par Ref n -- TODO: Test if it is a Data constructor.
-parsedToCore (PApp f x) = App (parsedToCore f) (parsedToCore x)
-parsedToCore (PBind n b x) =
-    Bind n (fmap parsedToCore b) (parsedToCore x)
-parsedToCore (PConst c) = Const c
-parsedToCore (PTypeE i) = Type i
-parsedToCore PTypeI = Type 0 -- TODO
-parsedToCore PHole = trace "parsedToCore Recieved Hole!" $
-    Par Ref (SName "_")
--}
+type PEnv = [(Name, Binder (PTerm Name))]
 
 type IParser a = ParsecT String () (State SourcePos) a
 
-tokenParser :: Tok.GenTokenParser String a (State SourcePos)
-tokenParser = Tok.makeTokenParser
-    emptyDef {
-        Tok.reservedOpNames = [":", "=", "\\", "|", "->", "=>"],
-        Tok.reservedNames = ["data", "where", "Type"],
+parsedToCore :: PEnv -> PTerm Name -> TypeCheck (Term Name)
+parsedToCore env (PPar n)
+    | holeName n = return $ Par Bound n (Type 0)
+    | otherwise  =
+        fmap (Par Bound n) . parsedToCore env
+            =<< lookupName env mempty n -- TODO: What if it's a Ref?
+parsedToCore env (PApp f x) =
+    App <$> parsedToCore env f <*> parsedToCore env x
+parsedToCore env (PBind n lam@(Lam ty) x) =
+    Bind n . Lam
+        <$> parsedToCore env ty
+        <*> parsedToCore ((n, lam) : env) x
+parsedToCore env (PBind n hole@(Hole ty) x) =
+    Bind n . Hole
+        <$> parsedToCore env ty
+        <*> parsedToCore ((n, hole) : env) x
+parsedToCore env (PBind n pi'@(Pi ty) x) =
+    Bind n . Pi
+        <$> parsedToCore env ty
+        <*> parsedToCore ((n, pi') : env) x
+parsedToCore env (PBind n lt@(Let ty val) x) = do
+    lt' <- Let <$> parsedToCore env ty <*> parsedToCore env val
+    Bind n lt' <$> parsedToCore ((n, lt) : env) x
+parsedToCore _ (PConstant cnst) = return $ Constant cnst
+parsedToCore _  PTypeI    = return $ Type 0  -- TODO
+parsedToCore _ (PTypeE i) = return $ Type i
 
-        Tok.commentStart = "{-",
-        Tok.commentEnd = "-}",
-        Tok.commentLine = "--",
-        Tok.nestedComments = True,
-        Tok.identStart = letter,
-        Tok.identLetter = alphaNum <|> oneOf "_'",
-        Tok.opStart = oneOf ":!#$%&*+./<=>?@\\^|-~",
-        Tok.opLetter = oneOf ":!#$%&*+./<=>?@\\^|-~",
-        Tok.caseSensitive = True
-    }
+explicitHoles :: Term Name -> TypeCheck (Term Name)
+explicitHoles x = do
+    (x',(holes,_)) <- runStateT (explicitHoles' [] x) ([], 0)
+    return $
+        foldr (\(holeN, holeTy) b -> Bind holeN (Hole holeTy) b)
+              x' holes
+
+explicitHoles' ::
+    [(Name, Binder (Term Name))] ->
+    Term Name ->
+    StateT ([(Name, Term Name)], Int) TypeCheck (Term Name)
+explicitHoles' _ p@(Par nt n ty)
+    | holeName n = Par nt <$> genName ty <*> return ty
+    | otherwise  = return p
+explicitHoles' env (App f x@(Par nt n _))
+    | holeName n = do
+        f' <- explicitHoles' env f
+        tyF <- lift $ typeOf env mempty f' --TODO: CONTEXT
+        case tyF of
+            Bind _ (Pi tyN) _ ->
+                App f' <$> (Par nt <$> genName tyN <*> return tyN)
+            _ -> lift $ TypeError (NotAFunction f')
+    | otherwise = App <$> explicitHoles' env f <*> return x
+explicitHoles' env (App f x) =
+    App <$> explicitHoles' env f <*> explicitHoles' env x
+explicitHoles' env (Bind n (Lam ty) x) =
+    let env' = (n,Lam ty):env
+    in Bind n . Lam
+            <$> explicitHoles' env' ty
+            <*> explicitHoles' env' x
+explicitHoles' env (Bind n (Hole ty) x) =
+    let env' = (n,Hole ty):env
+    in Bind n . Hole
+            <$> explicitHoles' env' ty
+            <*> explicitHoles' env' x
+explicitHoles' env (Bind n (Pi ty) x) =
+    let env' = (n,Pi ty):env
+    in Bind n . Pi
+            <$> explicitHoles' env' ty
+            <*> explicitHoles' env' x
+explicitHoles' env (Bind n (Let ty val) x) = do
+    let env' = (n,Let ty val):env
+    lt' <- Let
+            <$> explicitHoles' env ty
+            <*> explicitHoles' env' val
+
+    Bind n lt'
+            <$> explicitHoles' env' x
+explicitHoles' _ c@Constant{} = return c
+explicitHoles' _ t@Type{} = return t
+
+genName :: Term Name -> StateT ([(Name, Term Name)], Int) TypeCheck Name
+genName ty = do
+    (n, i) <- get
+    put (n, i+1)
+    let name = SName $ "hole" ++ show i
+    modify $ \(ns, i') -> ((name, ty) : ns, i')
+    return name
+
+holeName :: Name -> Bool
+holeName (SName "_") = True
+holeName (IName _ "_") = True
+holeName _ = False
+
+----------------
+-- Def Parser --
+----------------
+
+parseContext :: IParser (Context (PTerm Name))
+parseContext = MkContext . uncurry M.singleton <$> parseFuncDef
+
+parseFuncDef :: IParser (Name, Def (PTerm Name))
+parseFuncDef = do
+    name <- lexeme identifier
+    lexeme $ reservedOp ":"
+    ty <- parseExpr
+
+    checkIndent
+
+    _name' <- lexeme identifier
+    -- if name == name'
+    lexeme $ reservedOp "="
+    term <- sameOrIndented (lexeme parseExpr)
+
+    return (name, Function ty term)
+
+------------
+-- Parser --
+------------
+
+iparse :: IParser a -> SourceName -> String -> Either ParseError a
+iparse p n s = runIdentity .
+    flip evalStateT (initialPos n) $ runParserT p () n s
+
+tokenParser :: Tok.GenTokenParser String a (State SourcePos)
+tokenParser =
+    let tp = emptyDef {
+        Tok.reservedOpNames = [":", "=", ":=", "\\", "|", "->", "=>"],
+        Tok.reservedNames   = ["data", "where", "Type", "_"],
+
+        Tok.commentStart    = "{-",
+        Tok.commentEnd      = "-}",
+        Tok.commentLine     = "--",
+        Tok.nestedComments  = True,
+        Tok.identStart      = letter,
+        Tok.identLetter     = alphaNum <|> oneOf "_'",
+        Tok.opStart         = oneOf ":!#$%&*+./<=>?@\\^|-~",
+        Tok.opLetter        = Tok.opStart tp,
+        Tok.caseSensitive   = True
+        }
+    in Tok.makeTokenParser tp
 
 reservedOp :: String -> IParser ()
 reservedOp = Tok.reservedOp tokenParser
@@ -121,9 +178,13 @@ reservedOp = Tok.reservedOp tokenParser
 reserved :: String -> IParser ()
 reserved = Tok.reserved tokenParser
 
-ident :: IParser Name
-ident = SName <$> Tok.identifier tokenParser
-    <?> "ident"
+identifier :: IParser Name
+identifier =
+    SName <$> (try         (Tok.identifier tokenParser)
+          <|>  try (parens (Tok.identifier tokenParser))
+          <|>  try    (lexeme (string "_"))
+          <|>  parens (lexeme (string "_")))
+    <?> "identifier"
 
 lexeme :: IParser a -> IParser a
 lexeme = Tok.lexeme tokenParser
@@ -131,105 +192,54 @@ lexeme = Tok.lexeme tokenParser
 parens :: IParser a -> IParser a
 parens = Tok.parens tokenParser
 
------------------
--- Data Parser --
------------------
+----
+----
 
-iparse :: IParser a -> SourceName -> String -> Either ParseError a
-iparse p n s = runIdentity $
-    flip evalStateT (initialPos n) $ runParserT p () n s
-
-testDecl = iparse decl "testDecl" $ --"test = Maybe a -> a"
-    "test : Type 0\ntest = Int"
-{-
-    "data Maybe : Type 0 -> Type 0 where\n" ++
-    "    Just : (a : Type 0) -> a -> Maybe a\n" ++
-    "    Nothing : (a : Type 0) -> Maybe a\n"
--}
-
-decl :: IParser (PDecl (Expr Name))
-decl = try caf <|> (Data <$> dataDecl)
-
-caf :: IParser (PDecl (Expr Name))
-caf = do
-    (nameT, ty)   <- cafType
---    (nameB, expr) <- indented cafBody
-    checkIndent
-    (nameB, expr) <- cafBody
-    if nameT /= nameB
-        then error "Parser.caf: names don't match."
-        else return $ Caf nameT expr ty
-
-cafType :: IParser (Name, Expr Name)
-cafType = (,) <$> (lexeme ident <* lexeme (reservedOp ":"))
-              <*> lexeme parseExpr
-
-cafBody :: IParser (Name, Expr Name)
-cafBody = (,) <$> (lexeme ident <* lexeme (reservedOp "="))
-              <*> lexeme parseExpr
-
-dataDecl :: IParser (PData (Expr Name))
-dataDecl = uncurry PDataDecl <$> lexeme dataDeclTy <*> block dataDeclCon
-
-dataDeclTy :: IParser (Name, Expr Name)
-dataDeclTy =
-    between (lexeme (reserved "data"))
-            (lexeme (reserved "where"))
-            (lexeme (typedIdent))
-
-dataDeclCon :: IParser (Name, Expr Name)
-dataDeclCon = lexeme typedIdent
-{- liftA2 (:) (lexeme typedIdent) . many $
-    lexeme (reservedOp "|") *>
-    lexeme typedIdent -}
-
-------------
--- Parser --
-------------
-
-parseExpr :: IParser (Expr Name)
+parseExpr :: IParser (PTerm Name)
 parseExpr = try piLam <|> try lambda <|> try app <|> atom
-    <?> "expr"
+    <?> "parseExpr"
 
-app :: IParser (Expr Name)
+app :: IParser (PTerm Name)
 app = do
-    foldl1' App <$> many1 (sameOrIndented $ lexeme atom) <?> "app"
+    foldl1' PApp <$> many1 (sameOrIndented $ lexeme atom) <?> "app"
 
-atom :: IParser (Expr Name)
+atom :: IParser (PTerm Name)
 atom = try constant <|> try var <|> parens parseExpr <?> "atom"
 
-lambda :: IParser (Expr Name)
+lambda :: IParser (PTerm Name)
 lambda = (do
     reservedOp "\\"
-    (name, ty) <- same . lexeme $ parens typedIdent
-    same . lexeme $ reservedOp "=>"
+    (name, ty) <- same . lexeme $
+            try (parens typedIdent)
+        <|>     ((,PPar "_") <$> identifier)
+    sameOrIndented . lexeme $ reservedOp "=>"
     body <- sameOrIndented parseExpr
-    return $ Bind name (Lam ty) body
+    return $ PBind name (Lam ty) body
     ) <?> "lambda"
 
-piLam :: IParser (Expr Name)
+piLam :: IParser (PTerm Name)
 piLam = (do
     (name, pit) <-
             try ((\(n,t) -> (n, Pi t)) <$> lexeme (parens typedIdent))
-        <|>     (UName,) . Pi <$> (try lambda <|> try app <|> atom)
+        <|>     (SName "_",) . Pi <$> (try lambda <|> try app <|> atom)
     sameOrIndented . lexeme $ reservedOp "->"
     body <- sameOrIndented $ lexeme parseExpr
-    return $ Bind name pit body
+    return $ PBind name pit body
     ) <?> "piLam"
 
-var :: IParser (Expr Name)
-var = Par Ref <$> ident
+var :: IParser (PTerm Name)
+var = PPar <$> identifier
 
-constant :: IParser (Expr Name)
-constant = Const <$> (try constVal <|> try (ConstTy <$> constTy))
-                 <|> typeUniverse
+constant :: IParser (PTerm Name)
+constant = PConstant <$> (try constVal <|> try (ConstTy <$> constTy))
+                     <|>  typeUniverse
     <?> "constant"
 
-constVal :: IParser Const
+constVal :: IParser Constant
 constVal =
      try (ConstStr               <$> Tok.stringLiteral tokenParser)
- <|> try (ConstFlt . realToFrac  <$> Tok.float tokenParser)
- <|>     (ConstInt . fromInteger <$> Tok.integer tokenParser)
+ <|> try (ConstFlt . realToFrac  <$> Tok.float         tokenParser)
+ <|>     (ConstInt . fromInteger <$> Tok.integer       tokenParser)
  <?> "constVal"
 
 constTy :: IParser ConstTy
@@ -239,32 +249,67 @@ constTy =
     <|>     (StrTy <$ string "String")
     <?> "constTy"
 
-typeUniverse :: IParser (Expr Name)
+typeUniverse :: IParser (PTerm Name)
 typeUniverse = lexeme (reserved "Type") *>
-    (Type . read <$> option "0" (sameOrIndented $ many1 digit))
+    option PTypeI (PTypeE . read <$> sameOrIndented (many1 digit))
 
-typedIdent :: IParser (Name, Expr Name)
+typedIdent :: IParser (Name, PTerm Name)
 typedIdent =
-    (,) <$> lexeme ident <*  sameOrIndented (lexeme (char ':'))
-                         <*> sameOrIndented (lexeme  parseExpr)
+    (,) <$> lexeme identifier <*  sameOrIndented (lexeme (char ':'))
+                              <*> sameOrIndented (lexeme  parseExpr)
     <?> "typedIdent"
 
-test = iparse (allOf parseExpr) "test" "\\(whatever : Int) => 123.32 whatever"
+-------------------
+-- Second Parser --
+-------------------
 
-idd = iparse (allOf parseExpr) "idd"
-    "\\(A : Type 0 -> Type 0) => A"
+parseContext' :: IParser (Context (PTerm Name))
+parseContext' =
+    MkContext . M.fromList <$> many (lexeme parseCoqDef)
 
-ide = iparse (allOf parseExpr) "ide"
-        "(\\(A : Type 0) => \\(f : A -> A) => \\(x : A) => f x) Int plus"
+parseCoqDef :: IParser (Name, Def (PTerm Name))
+parseCoqDef = do
+    -- Definition name.
+    name <- lexeme identifier
+    -- Typed, named args.
+    args <- many (parens typedIdent)
+
+    lexeme (reservedOp ":")
+
+    -- Unnamed args / body type.
+    tyBody <- parseExpr
+
+    lexeme (reservedOp ":=")
+
+    -- Definition body.
+    term <- lexeme (sameOrIndented parseExpr)
+    --term <- sameOrIndented (lexeme parseExpr)
+
+        -- Total type, with Pis added for args.
+    let tyTotal = addPis args tyBody
+        -- Total term, with Lams added for args.
+        termTotal = addLams args term
+
+    return (name, Function tyTotal termTotal)
+
+addLams :: [(Name, PTerm Name)] -> PTerm Name -> PTerm Name
+addLams = flip . foldr $ uncurry ((. Lam) . PBind)
+
+addPis :: [(Name, PTerm Name)] -> PTerm Name -> PTerm Name
+addPis = flip . foldr $ uncurry ((. Pi) . PBind)
+
+--------------------
+-- Parser Helpers --
+--------------------
 
 sameOrIndented :: IParser a -> IParser a
-sameOrIndented p = sameOrIndentCheck >> p
+sameOrIndented = (sameOrIndentCheck >>)
 
 sameOrIndentCheck :: IParser ()
 sameOrIndentCheck = checkSame <|> indent
 
 indented :: IParser a -> IParser a
-indented x = indent >> x
+indented = (indent >>)
 
 indent :: IParser ()
 indent = do
@@ -275,7 +320,7 @@ indent = do
     else put $ setSourceLine s (sourceLine pos)
 
 same :: IParser a -> IParser a
-same x = checkSame >> x
+same = (checkSame >>)
 
 checkSame :: IParser ()
 checkSame = do
@@ -310,109 +355,116 @@ infixr 5 <++>
 (<++>) :: Monoid a => IParser a -> IParser a -> IParser a
 (<++>) = liftA2 mappend
 
-testExpr :: Expr String
-testExpr = App (Bind "val" (Lam (Const $ ConstTy IntTy)) (Var 0))
-           (Const (ConstInt 12))
+-------------
+-- TESTING --
+-------------
 
+newP = case newParse of
+    MkContext defMap -> case snd . head . M.toList $ defMap of
+        Function ty term -> do
+            tyC   <- parsedToCore [] ty
+            termC <- parsedToCore [] term
+            return (Function tyC termC)
+        TyDecl n ty -> TyDecl n <$> parsedToCore [] ty
+
+newP' = case newParse of
+    MkContext defMap -> case snd . head . M.toList $ defMap of
+        Function ty term -> do
+            tyC   <- parsedToCore [] ty
+            termC <- parsedToCore [] term
+            return (tyC, termC)
+        TyDecl _ ty -> do
+            tyC <- parsedToCore [] ty
+            return (tyC, error "axiom")
+
+testNew = case newP' of
+    PassCheck (ty, term) -> do
+        print $ pPrint term
+        putStr "    : "
+        print $ pPrint ty
+    _ -> return ()
+
+newParseC = flip fmap newParse $ \x ->
+    case parsedToCore [] x of
+        PassCheck p -> p
+        TypeError err -> error $ show err
+
+newParse = parsef (allOf parseContext') "newParse" $
+    "id (A : Type) (a : A) : A := a\n" ++
+    "const (A : Type) (B : Type) (a : A) (b : B) : B := b\n" ++
+    "aVal : Int := id Int (const Float Int 13.2 100)"
+
+--
+
+parsef p t s =
+    let Right x = iparse p t s
+    in x
+
+testDef = iparse (allOf parseContext) "testDef" $
+    "hello : Int\n"++
+    "hello = (\\a => \\b => b) 12 13"
 {-
-data PExpr n =
-    PVar n
-  | PApp (PExpr n) (PExpr n)
-  | PBind n (Binder (PExpr n)) (PExpr n)
-  | PConst !Const
-  | PIType
-  | PEType !Int
-  deriving (Show, Eq, Functor)
-
---parsedToCore :: PExpr n -> Expr n
---parsedToCore (PVar n)
-
-tokenParser :: Tok.TokenParser a
-tokenParser = Tok.makeTokenParser haskellStyle
-
-topParse :: IParser (PExpr Name)
-topParse =
-    try lambda <|> try piLam <|> try app <|> atom
-    <?> "topParse"
-
-app :: IParser (PExpr Name)
-app = foldr1 PApp <$> many1 (atom <* spaces) <?> "app"
-
-atom :: IParser (PExpr Name)
-atom = try constant <|> try var <|> paren topParse <?> "atom"
-
-lambda :: IParser (PExpr Name)
-lambda = (do
-    void $ Tok.reservedOp tokenParser "\\"
-    (name, ty) <- paren typedIdent
-    spaces
-    void $ Tok.reservedOp tokenParser "=>"
-    spaces
-    body <- topParse
-    return $ PBind name (Lam ty) body
-    ) <?> "lambda"
-
-piLam :: IParser (PExpr Name)
-piLam = (do
-    (name, pit) <- try ((\(n,t) -> (n, Pi t)) <$> paren typedIdent)
-               <|> try ((\n -> (UName, Pi (PVar n))) <$> ident)
-               <|> (UName,) . Pi <$> constant
-    spaces
-    void $ Tok.reservedOp tokenParser "->"
-    spaces
-    body <- topParse
-    return $ PBind name pit body
-    ) <?> "piLam"
-
-var :: IParser (PExpr Name)
-var = PVar <$> ident
-
-constant :: IParser (PExpr Name)
-constant = PConst <$> (try constVal <|> try (ConstTy <$> constTy))
-                  <|> typeUniverse
-    <?> "constant"
-
-constVal :: IParser Const
-constVal =
-     try (ConstStr        <$> (char '\"' >> manyTill anyChar (char '\"')))
- <|> try (ConstFlt . read <$> many1 digit <++> string "." <++> many digit)
- <|>     (ConstInt . read <$> many1 digit)
- <?> "constVal"
-
-
-constTy :: IParser ConstTy
-constTy =
-        try (IntTy <$ string "Int")
-    <|> try (FltTy <$ string "Float")
-    <|>     (StrTy <$ string "String")
-    <?> "constTy"
-
-typeUniverse :: IParser (PExpr Name)
-typeUniverse = do
-    Tok.reserved tokenParser "Type" >>
-        ((spaces >> (PEType . read <$> many1 digit)) <|> return PIType)
-
-typedIdent :: IParser (Name, PExpr Name)
-typedIdent =
-    (,) <$> ident <* (spaces >> char ':' >> spaces) <*> topParse
-    <?> "typedIdent"
-
-ident :: IParser Name
-ident = SName <$> Tok.identifier tokenParser
-    <?> "ident"
-
-allOf :: IParser a -> IParser a
-allOf p = p <* eof
-
-test = parseTest (allOf topParse) "\\(whatever : Int) => 123.32 whatever"
-
-ide = parseTest (allOf topParse)
-    "\\(A : Type 0) => \\(f : A -> A) => \\(x : A) => f x"
-
-paren :: IParser a -> IParser a
-paren = between (char '(') (char ')')
-
-infixr 5 <++>
-(<++>) :: Monoid a => IParser a -> IParser a -> IParser a
-(<++>) = liftA2 mappend
+    "id : (A : Type) -> A -> A\n"++
+    "id = \\ty => \\a => a"
 -}
+
+testDef' =
+    let Right (MkContext td) = testDef
+        (Function ty fun) = snd . head . M.toList $ td
+
+        PassCheck funC    = explicitHoles =<< parsedToCore [] fun
+--        funCN             = normalize funC
+
+        PassCheck tyC     = explicitHoles =<< parsedToCore [] ty
+--        tyCN              = normalize tyC
+
+        PassCheck tyCI    = explicitHoles =<< typeOf [] mempty funC
+--        tyCIN             = normalize tyCI
+    in do
+        print $ tyCI
+        let PassCheck s = unify [] tyC tyCI
+        print s
+        let tyCI' = applySubst (M.fromList s) tyCI
+        return $ Function tyCI' funC
+
+idp = parsef (allOf parseExpr) "idp" $
+    "(\\(A : Type) => \\(a : A) => a) " ++
+    "_ 123"
+
+idpC = parsedToCore [] idp
+idpC' = idpC >>= explicitHoles
+idpCN = fmap normalize idpC'
+tyIdp = fmap (typeOf [] mempty) idpCN
+
+tenC' = fmap normalize tenC
+tyTen = fmap (typeOf [] mempty) tenC
+tenC  = parsedToCore [] ten
+
+idC  = parsedToCore [] id'
+tyId = fmap (typeOf [] mempty) idC
+
+apps :: PTerm Name -> [PTerm Name] -> PTerm Name
+apps = foldl' PApp
+
+id' :: PTerm Name
+id' = PBind "A" (Lam PTypeI) $
+      PBind "a" (Lam (PPar "A")) $
+      PPar "a"
+
+ten :: PTerm Name
+ten = apps id' [PConstant (ConstTy IntTy),
+                PConstant (ConstInt 10)]
+
+filled = do
+    ty <- holeyT
+    fill <- unify [] ty (Type 0)
+    return $ foldr (\(n,r) x -> subst n r x) ty fill
+
+holeyT = typeOf [] mempty =<< parsedToCore [] holey
+
+holey :: PTerm Name
+holey = PBind "ty" (Hole PTypeI) $
+    apps id' [PPar "ty", PConstant (ConstTy IntTy)]
+
+--holey = PBind "ty" (Hole PTypeI) $
+--  apps id' [PPar "ty", PConstant (ConstInt 10)]
