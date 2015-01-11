@@ -8,7 +8,6 @@ import Data.Monoid (Monoid(..))
 import Control.Applicative hiding ((<|>), many)
 import Data.Functor.Identity (runIdentity)
 import Control.Monad.State
-import Text.PrettyPrint.HughesPJClass (Pretty(..))
 
 import Text.Parsec hiding (State)
 import Text.Parsec.Pos (initialPos)
@@ -18,7 +17,7 @@ import Text.Parsec.Language (emptyDef)
 import qualified Data.Map as M
 
 import Term
-import Tactic
+--import Tactic
 
 data PTerm n =
     PPar n
@@ -33,6 +32,60 @@ type PEnv = [(Name, Binder (PTerm Name))]
 
 type IParser a = ParsecT String () (State SourcePos) a
 
+
+parsedCtxToCore ::
+    PEnv ->
+    Context (PTerm Name) ->
+    TypeCheck (Context (Term Name))
+parsedCtxToCore env ctx@(MkContext defMap) = do
+    MkContext . M.fromList <$> parsedCtxToCore' (M.toList defMap)
+  where
+    parsedCtxToCore' ::
+        [(Name, Def (PTerm Name))] ->
+        TypeCheck [(Name, Def (Term Name))]
+    parsedCtxToCore' ((n, Function ty term) : xs) = do
+        xs' <- parsedCtxToCore' xs
+        ty'   <- parsedToCore env ctx ty
+        term' <- parsedToCore env ctx term
+        return $ (n, Function ty' term') : xs'
+    parsedCtxToCore' ((n, TyDecl nt ty) : xs) = do
+        xs' <- parsedCtxToCore' xs
+        ty' <- parsedToCore env ctx ty
+        return $ (n, TyDecl nt ty') : xs'
+    parsedCtxToCore' [] = return []
+
+parsedToCore ::
+    PEnv ->
+    Context (PTerm Name) ->
+    PTerm Name ->
+    TypeCheck (Term Name)
+parsedToCore env ctx (PPar n)
+    | holeName n = return $ Par Bound n (Type 0)
+    | otherwise  =
+        fmap (Par Bound n) . parsedToCore env ctx
+            =<< lookupName env ctx n -- TODO: What if it's a Ref?
+parsedToCore env ctx (PApp f x) =
+    App <$> parsedToCore env ctx f <*> parsedToCore env ctx x
+parsedToCore env ctx (PBind n lam@(Lam ty) x) =
+    Bind n . Lam
+        <$> parsedToCore env ctx ty
+        <*> parsedToCore ((n, lam) : env) ctx x
+parsedToCore env ctx (PBind n hole@(Hole ty) x) =
+    Bind n . Hole
+        <$> parsedToCore env ctx ty
+        <*> parsedToCore ((n, hole) : env) ctx x
+parsedToCore env ctx (PBind n pi'@(Pi ty) x) =
+    Bind n . Pi
+        <$> parsedToCore env ctx ty
+        <*> parsedToCore ((n, pi') : env) ctx x
+parsedToCore env ctx (PBind n lt@(Let ty val) x) = do
+    lt' <- Let <$> parsedToCore env ctx ty <*> parsedToCore env ctx val
+    Bind n lt' <$> parsedToCore ((n, lt) : env) ctx x
+parsedToCore _ _ (PConstant cnst) = return $ Constant cnst
+parsedToCore _ _  PTypeI    = return $ Type 0  -- TODO
+parsedToCore _ _ (PTypeE i) = return $ Type i
+
+{-
 parsedToCore :: PEnv -> PTerm Name -> TypeCheck (Term Name)
 parsedToCore env (PPar n)
     | holeName n = return $ Par Bound n (Type 0)
@@ -59,57 +112,59 @@ parsedToCore env (PBind n lt@(Let ty val) x) = do
 parsedToCore _ (PConstant cnst) = return $ Constant cnst
 parsedToCore _  PTypeI    = return $ Type 0  -- TODO
 parsedToCore _ (PTypeE i) = return $ Type i
+-}
 
-explicitHoles :: Term Name -> TypeCheck (Term Name)
-explicitHoles x = do
-    (x',(holes,_)) <- runStateT (explicitHoles' [] x) ([], 0)
+explicitHoles :: Term Name -> Context (Term Name) -> TypeCheck (Term Name)
+explicitHoles x ctx = do
+    (x',(holes,_)) <- runStateT (explicitHoles' [] ctx x) ([], 0)
     return $
         foldr (\(holeN, holeTy) b -> Bind holeN (Hole holeTy) b)
               x' holes
 
 explicitHoles' ::
     [(Name, Binder (Term Name))] ->
+    Context (Term Name) ->
     Term Name ->
     StateT ([(Name, Term Name)], Int) TypeCheck (Term Name)
-explicitHoles' _ p@(Par nt n ty)
+explicitHoles' _ _ p@(Par nt n ty)
     | holeName n = Par nt <$> genName ty <*> return ty
     | otherwise  = return p
-explicitHoles' env (App f x@(Par nt n _))
+explicitHoles' env ctx (App f x@(Par nt n _))
     | holeName n = do
-        f' <- explicitHoles' env f
-        tyF <- lift $ typeOf env mempty f' --TODO: CONTEXT
+        f' <- explicitHoles' env ctx f
+        tyF <- lift $ typeOf env ctx f'
         case tyF of
             Bind _ (Pi tyN) _ ->
                 App f' <$> (Par nt <$> genName tyN <*> return tyN)
             _ -> lift $ TypeError (NotAFunction f')
-    | otherwise = App <$> explicitHoles' env f <*> return x
-explicitHoles' env (App f x) =
-    App <$> explicitHoles' env f <*> explicitHoles' env x
-explicitHoles' env (Bind n (Lam ty) x) =
+    | otherwise = App <$> explicitHoles' env ctx f <*> return x
+explicitHoles' env ctx (App f x) =
+    App <$> explicitHoles' env ctx f <*> explicitHoles' env ctx x
+explicitHoles' env ctx (Bind n (Lam ty) x) =
     let env' = (n,Lam ty):env
     in Bind n . Lam
-            <$> explicitHoles' env' ty
-            <*> explicitHoles' env' x
-explicitHoles' env (Bind n (Hole ty) x) =
+            <$> explicitHoles' env' ctx ty
+            <*> explicitHoles' env' ctx x
+explicitHoles' env ctx (Bind n (Hole ty) x) =
     let env' = (n,Hole ty):env
     in Bind n . Hole
-            <$> explicitHoles' env' ty
-            <*> explicitHoles' env' x
-explicitHoles' env (Bind n (Pi ty) x) =
+            <$> explicitHoles' env' ctx ty
+            <*> explicitHoles' env' ctx x
+explicitHoles' env ctx (Bind n (Pi ty) x) =
     let env' = (n,Pi ty):env
     in Bind n . Pi
-            <$> explicitHoles' env' ty
-            <*> explicitHoles' env' x
-explicitHoles' env (Bind n (Let ty val) x) = do
+            <$> explicitHoles' env' ctx ty
+            <*> explicitHoles' env' ctx x
+explicitHoles' env ctx (Bind n (Let ty val) x) = do
     let env' = (n,Let ty val):env
     lt' <- Let
-            <$> explicitHoles' env ty
-            <*> explicitHoles' env' val
+            <$> explicitHoles' env ctx ty
+            <*> explicitHoles' env' ctx val
 
     Bind n lt'
-            <$> explicitHoles' env' x
-explicitHoles' _ c@Constant{} = return c
-explicitHoles' _ t@Type{} = return t
+            <$> explicitHoles' env' ctx x
+explicitHoles' _ _ c@Constant{} = return c
+explicitHoles' _ _ t@Type{} = return t
 
 genName :: Term Name -> StateT ([(Name, Term Name)], Int) TypeCheck Name
 genName ty = do
@@ -359,46 +414,30 @@ infixr 5 <++>
 -- TESTING --
 -------------
 
-newP = case newParse of
-    MkContext defMap -> case snd . head . M.toList $ defMap of
-        Function ty term -> do
-            tyC   <- parsedToCore [] ty
-            termC <- parsedToCore [] term
-            return (Function tyC termC)
-        TyDecl n ty -> TyDecl n <$> parsedToCore [] ty
+parsef p t s =
+    let Right x = iparse p t s
+    in x
 
-newP' = case newParse of
-    MkContext defMap -> case snd . head . M.toList $ defMap of
-        Function ty term -> do
-            tyC   <- parsedToCore [] ty
-            termC <- parsedToCore [] term
-            return (tyC, termC)
-        TyDecl _ ty -> do
-            tyC <- parsedToCore [] ty
-            return (tyC, error "axiom")
+--
 
-testNew = case newP' of
-    PassCheck (ty, term) -> do
-        print $ pPrint term
-        putStr "    : "
-        print $ pPrint ty
-    _ -> return ()
+testParseC = do
+    npc@(MkContext npcm) <- newParseC
+    let val = head $ M.toList npcm
+    case val of
+        (_, Function _ term) -> return $ substCtx term npc
+        _ -> undefined
+--    return . head $ M.toList npcm
 
-newParseC = flip fmap newParse $ \x ->
-    case parsedToCore [] x of
-        PassCheck p -> p
-        TypeError err -> error $ show err
+newParseC = parsedCtxToCore [] newParse
 
 newParse = parsef (allOf parseContext') "newParse" $
     "id (A : Type) (a : A) : A := a\n" ++
     "const (A : Type) (B : Type) (a : A) (b : B) : B := b\n" ++
-    "aVal : Int := id Int (const Float Int 13.2 100)"
+    "aVal : Int := id _ (const _ _ 13.2 100)"
 
 --
 
-parsef p t s =
-    let Right x = iparse p t s
-    in x
+{-
 
 testDef = iparse (allOf parseContext) "testDef" $
     "hello : Int\n"++
@@ -468,3 +507,5 @@ holey = PBind "ty" (Hole PTypeI) $
 
 --holey = PBind "ty" (Hole PTypeI) $
 --  apps id' [PPar "ty", PConstant (ConstInt 10)]
+
+-}

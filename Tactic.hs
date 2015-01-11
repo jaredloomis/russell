@@ -37,6 +37,7 @@ data ProofTerm = ProofTerm {
 -----------
 -----------
 
+-- TODO
 infer :: Term Name -> Term Name -> TypeCheck (Term Name)
 infer term ty = do
     tyI <- typeOf [] mempty term

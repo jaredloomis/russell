@@ -36,7 +36,7 @@ instance Pretty n => Pretty (Term n) where
         <> ")"
     pPrint (Bind n (Hole ty) b) =
         "(" <>
-        "\\(__" <> pPrint n <> "__ : " <> pPrint ty <> ") =>" <>
+        "\\(__" <> pPrint n <> "__ : " <> pPrint ty <> ") => " <>
         pPrint b
         <> ")"
     pPrint (Bind n (Pi ty) b) =
@@ -357,6 +357,14 @@ isUniverse _ = False
 -------------------------
 -- Operations on Terms --
 -------------------------
+
+substCtx :: Term Name -> Context (Term Name) -> Term Name
+substCtx term (MkContext defMap) =
+    foldr substDef term (M.toList defMap)
+  where
+    substDef (n, Function _ val) acc = subst n val acc
+    substDef (_, TyDecl{}) acc = acc
+
 
 normalize :: Eq n => Term n -> Term n
 normalize (Bind n (Lam ty) b) =
