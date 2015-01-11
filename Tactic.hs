@@ -9,7 +9,7 @@ import qualified Data.Map as M
 import Term
 
 {-
-type Cogito a = StateT CState TypeCheck a
+type Russel a = StateT CState TypeCheck a
 
 data CState = CState {
     cogCtx :: Context (Term Name)

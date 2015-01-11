@@ -68,4 +68,8 @@ stdRepl = replIO stdlib
 stdlib = parsef (allOf parseContext') "newParse" $
     "id (A : Type) (a : A) : A := a\n" ++
     "const (A : Type) (B : Type) (a : A) (b : B) : B := b\n" ++
-    "aVal : Int := id _ (const _ _ 13.2 100)"
+    "aVal : Int := id _ (const _ _ 13.2 100)\n" ++
+
+    "data Nat : Type where\n" ++
+    "    Z : Nat\n" ++
+    "    S : Nat -> Nat\n"

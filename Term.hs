@@ -182,12 +182,20 @@ data Def t =
     -- ^ Function type term
   | TyDecl NameType t
     -- ^ TyDecl nametype type
+  | CaseOp
   deriving (Show, Eq, Functor)
 
 instance Pretty t => Pretty (Def t) where
     pPrint (Function ty term) =
         pPrint term <> "\n    : " <> pPrint ty
     pPrint (TyDecl nt ty) = pPrint nt <> " " <> pPrint ty
+
+-- TODO Case stuff
+
+data CaseTree t = Case [CaseAlt t]
+
+data CaseAlt t =
+    ConCase Name Int [Name]
 
 -------------------
 -- Type checking --

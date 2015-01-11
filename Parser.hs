@@ -8,6 +8,7 @@ import Data.Monoid (Monoid(..))
 import Control.Applicative hiding ((<|>), many)
 import Data.Functor.Identity (runIdentity)
 import Control.Monad.State
+import Control.Arrow hiding (app)
 
 import Text.Parsec hiding (State)
 import Text.Parsec.Pos (initialPos)
@@ -184,7 +185,9 @@ holeName _ = False
 ----------------
 
 parseContext :: IParser (Context (PTerm Name))
-parseContext = MkContext . uncurry M.singleton <$> parseFuncDef
+parseContext =
+      try (MkContext . uncurry M.singleton <$> parseFuncDef)
+  <|> parseDataDecl
 
 parseFuncDef :: IParser (Name, Def (PTerm Name))
 parseFuncDef = do
@@ -314,13 +317,30 @@ typedIdent =
                               <*> sameOrIndented (lexeme  parseExpr)
     <?> "typedIdent"
 
+-----------------------------
+-- Data declaration parser --
+-----------------------------
+
+parseDataDecl :: IParser (Context (PTerm Name))
+parseDataDecl = do
+    lexeme (reserved "data")
+    (tyName, ty) <- lexeme typedIdent
+    lexeme (reserved "where")
+
+    constrs <- map (id *** TyDecl (DataCon 0)) <$> block (typedIdent)
+
+    return . MkContext . M.fromList $ (tyName, TyDecl (TypeCon 0) ty) : constrs
+
 -------------------
 -- Second Parser --
 -------------------
 
 parseContext' :: IParser (Context (PTerm Name))
-parseContext' =
-    MkContext . M.fromList <$> many (lexeme parseCoqDef)
+parseContext' = fmap mconcat . many $
+    try parseDataDecl <|> parseCoqCtx
+
+parseCoqCtx :: IParser (Context (PTerm Name))
+parseCoqCtx = MkContext . uncurry M.singleton <$> lexeme parseCoqDef
 
 parseCoqDef :: IParser (Name, Def (PTerm Name))
 parseCoqDef = do
@@ -434,78 +454,3 @@ newParse = parsef (allOf parseContext') "newParse" $
     "id (A : Type) (a : A) : A := a\n" ++
     "const (A : Type) (B : Type) (a : A) (b : B) : B := b\n" ++
     "aVal : Int := id _ (const _ _ 13.2 100)"
-
---
-
-{-
-
-testDef = iparse (allOf parseContext) "testDef" $
-    "hello : Int\n"++
-    "hello = (\\a => \\b => b) 12 13"
-{-
-    "id : (A : Type) -> A -> A\n"++
-    "id = \\ty => \\a => a"
--}
-
-testDef' =
-    let Right (MkContext td) = testDef
-        (Function ty fun) = snd . head . M.toList $ td
-
-        PassCheck funC    = explicitHoles =<< parsedToCore [] fun
---        funCN             = normalize funC
-
-        PassCheck tyC     = explicitHoles =<< parsedToCore [] ty
---        tyCN              = normalize tyC
-
-        PassCheck tyCI    = explicitHoles =<< typeOf [] mempty funC
---        tyCIN             = normalize tyCI
-    in do
-        print $ tyCI
-        let PassCheck s = unify [] tyC tyCI
-        print s
-        let tyCI' = applySubst (M.fromList s) tyCI
-        return $ Function tyCI' funC
-
-idp = parsef (allOf parseExpr) "idp" $
-    "(\\(A : Type) => \\(a : A) => a) " ++
-    "_ 123"
-
-idpC = parsedToCore [] idp
-idpC' = idpC >>= explicitHoles
-idpCN = fmap normalize idpC'
-tyIdp = fmap (typeOf [] mempty) idpCN
-
-tenC' = fmap normalize tenC
-tyTen = fmap (typeOf [] mempty) tenC
-tenC  = parsedToCore [] ten
-
-idC  = parsedToCore [] id'
-tyId = fmap (typeOf [] mempty) idC
-
-apps :: PTerm Name -> [PTerm Name] -> PTerm Name
-apps = foldl' PApp
-
-id' :: PTerm Name
-id' = PBind "A" (Lam PTypeI) $
-      PBind "a" (Lam (PPar "A")) $
-      PPar "a"
-
-ten :: PTerm Name
-ten = apps id' [PConstant (ConstTy IntTy),
-                PConstant (ConstInt 10)]
-
-filled = do
-    ty <- holeyT
-    fill <- unify [] ty (Type 0)
-    return $ foldr (\(n,r) x -> subst n r x) ty fill
-
-holeyT = typeOf [] mempty =<< parsedToCore [] holey
-
-holey :: PTerm Name
-holey = PBind "ty" (Hole PTypeI) $
-    apps id' [PPar "ty", PConstant (ConstTy IntTy)]
-
---holey = PBind "ty" (Hole PTypeI) $
---  apps id' [PPar "ty", PConstant (ConstInt 10)]
-
--}
