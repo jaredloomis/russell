@@ -21,12 +21,15 @@ import Term
 --import Tactic
 
 data PTerm n =
-    PPar n
+    PVar n
   | PApp (PTerm n) (PTerm n)
   | PBind n (Binder (PTerm n)) (PTerm n)
+  | PLam n (PTerm n)
+  | PLet n (PTerm n) (PTerm n)
   | PConstant !Constant
   | PTypeI
   | PTypeE !Int
+  | Placeholder
   deriving (Show, Eq, Functor)
 
 type PEnv = [(Name, Binder (PTerm Name))]
@@ -60,10 +63,10 @@ parsedToCore ::
     Context (PTerm Name) ->
     PTerm Name ->
     TypeCheck (Term Name)
-parsedToCore env ctx (PPar n)
-    | holeName n = return $ Par Bound n (Type 0)
+parsedToCore env ctx (PVar n)
+    | holeName n = return $ Var Bound n (Type 0)
     | otherwise  =
-        fmap (Par Bound n) . parsedToCore env ctx
+        fmap (Var Bound n) . parsedToCore env ctx
             =<< lookupName env ctx n -- TODO: What if it's a Ref?
 parsedToCore env ctx (PApp f x) =
     App <$> parsedToCore env ctx f <*> parsedToCore env ctx x
@@ -75,6 +78,9 @@ parsedToCore env ctx (PBind n hole@(Hole ty) x) =
     Bind n . Hole
         <$> parsedToCore env ctx ty
         <*> parsedToCore ((n, hole) : env) ctx x
+parsedToCore env ctx (PBind n lt@(Guess ty val) x) = do
+    lt' <- Guess <$> parsedToCore env ctx ty <*> parsedToCore env ctx val
+    Bind n lt' <$> parsedToCore ((n, lt) : env) ctx x
 parsedToCore env ctx (PBind n pi'@(Pi ty) x) =
     Bind n . Pi
         <$> parsedToCore env ctx ty
@@ -85,35 +91,8 @@ parsedToCore env ctx (PBind n lt@(Let ty val) x) = do
 parsedToCore _ _ (PConstant cnst) = return $ Constant cnst
 parsedToCore _ _  PTypeI    = return $ Type 0  -- TODO
 parsedToCore _ _ (PTypeE i) = return $ Type i
-
-{-
-parsedToCore :: PEnv -> PTerm Name -> TypeCheck (Term Name)
-parsedToCore env (PPar n)
-    | holeName n = return $ Par Bound n (Type 0)
-    | otherwise  =
-        fmap (Par Bound n) . parsedToCore env
-            =<< lookupName env mempty n -- TODO: What if it's a Ref?
-parsedToCore env (PApp f x) =
-    App <$> parsedToCore env f <*> parsedToCore env x
-parsedToCore env (PBind n lam@(Lam ty) x) =
-    Bind n . Lam
-        <$> parsedToCore env ty
-        <*> parsedToCore ((n, lam) : env) x
-parsedToCore env (PBind n hole@(Hole ty) x) =
-    Bind n . Hole
-        <$> parsedToCore env ty
-        <*> parsedToCore ((n, hole) : env) x
-parsedToCore env (PBind n pi'@(Pi ty) x) =
-    Bind n . Pi
-        <$> parsedToCore env ty
-        <*> parsedToCore ((n, pi') : env) x
-parsedToCore env (PBind n lt@(Let ty val) x) = do
-    lt' <- Let <$> parsedToCore env ty <*> parsedToCore env val
-    Bind n lt' <$> parsedToCore ((n, lt) : env) x
-parsedToCore _ (PConstant cnst) = return $ Constant cnst
-parsedToCore _  PTypeI    = return $ Type 0  -- TODO
-parsedToCore _ (PTypeE i) = return $ Type i
--}
+parsedToCore _ _ _ = TypeError $ Msg
+    "parsedToCore was given a term that is too complicated."
 
 explicitHoles :: Term Name -> Context (Term Name) -> TypeCheck (Term Name)
 explicitHoles x ctx = do
@@ -127,16 +106,16 @@ explicitHoles' ::
     Context (Term Name) ->
     Term Name ->
     StateT ([(Name, Term Name)], Int) TypeCheck (Term Name)
-explicitHoles' _ _ p@(Par nt n ty)
-    | holeName n = Par nt <$> genName ty <*> return ty
+explicitHoles' _ _ p@(Var nt n ty)
+    | holeName n = Var nt <$> genName ty <*> return ty
     | otherwise  = return p
-explicitHoles' env ctx (App f x@(Par nt n _))
+explicitHoles' env ctx (App f x@(Var nt n _))
     | holeName n = do
         f' <- explicitHoles' env ctx f
         tyF <- lift $ typeOf env ctx f'
         case tyF of
             Bind _ (Pi tyN) _ ->
-                App f' <$> (Par nt <$> genName tyN <*> return tyN)
+                App f' <$> (Var nt <$> genName tyN <*> return tyN)
             _ -> lift $ TypeError (NotAFunction f')
     | otherwise = App <$> explicitHoles' env ctx f <*> return x
 explicitHoles' env ctx (App f x) =
@@ -151,6 +130,14 @@ explicitHoles' env ctx (Bind n (Hole ty) x) =
     in Bind n . Hole
             <$> explicitHoles' env' ctx ty
             <*> explicitHoles' env' ctx x
+explicitHoles' env ctx (Bind n (Guess ty val) x) = do
+    let env' = (n,Guess ty val):env
+    lt' <- Guess
+            <$> explicitHoles' env ctx ty
+            <*> explicitHoles' env' ctx val
+
+    Bind n lt'
+            <$> explicitHoles' env' ctx x
 explicitHoles' env ctx (Bind n (Pi ty) x) =
     let env' = (n,Pi ty):env
     in Bind n . Pi
@@ -240,9 +227,15 @@ identifier :: IParser Name
 identifier =
     SName <$> (try         (Tok.identifier tokenParser)
           <|>  try (parens (Tok.identifier tokenParser))
-          <|>  try    (lexeme (string "_"))
-          <|>  parens (lexeme (string "_")))
+--          <|>  try    (lexeme (string "_"))
+--          <|>  parens (lexeme (string "_"))
+              )
     <?> "identifier"
+
+placeholder :: IParser (PTerm Name)
+placeholder = Placeholder <$
+           (try (lexeme $ reserved "_")
+     <|> parens (lexeme $ reserved "_"))
 
 lexeme :: IParser a -> IParser a
 lexeme = Tok.lexeme tokenParser
@@ -255,25 +248,26 @@ parens = Tok.parens tokenParser
 
 parseExpr :: IParser (PTerm Name)
 parseExpr = try piLam <|> try lambda <|> try app <|> atom
-    <?> "parseExpr"
+    <?> "Expression"
 
 app :: IParser (PTerm Name)
 app = do
-    foldl1' PApp <$> many1 (sameOrIndented $ lexeme atom) <?> "app"
+    foldl1' PApp <$> many1 (sameOrIndented $ lexeme atom)
+    <?> "Function application"
 
 atom :: IParser (PTerm Name)
-atom = try constant <|> try var <|> parens parseExpr <?> "atom"
+atom = try constant <|> try var <|> parens parseExpr <?> "Atom"
 
 lambda :: IParser (PTerm Name)
 lambda = (do
     reservedOp "\\"
     (name, ty) <- same . lexeme $
             try (parens typedIdent)
-        <|>     ((,PPar "_") <$> identifier)
+        <|>     ((,Placeholder) <$> identifier)
     sameOrIndented . lexeme $ reservedOp "=>"
     body <- sameOrIndented parseExpr
     return $ PBind name (Lam ty) body
-    ) <?> "lambda"
+    ) <?> "Lambda"
 
 piLam :: IParser (PTerm Name)
 piLam = (do
@@ -283,29 +277,29 @@ piLam = (do
     sameOrIndented . lexeme $ reservedOp "->"
     body <- sameOrIndented $ lexeme parseExpr
     return $ PBind name pit body
-    ) <?> "piLam"
+    ) <?> "Dependant function arrow"
 
 var :: IParser (PTerm Name)
-var = PPar <$> identifier
+var = try placeholder <|> (PVar <$> identifier)
 
 constant :: IParser (PTerm Name)
 constant = PConstant <$> (try constVal <|> try (ConstTy <$> constTy))
                      <|>  typeUniverse
-    <?> "constant"
+    <?> "Constant"
 
 constVal :: IParser Constant
 constVal =
      try (ConstStr               <$> Tok.stringLiteral tokenParser)
  <|> try (ConstFlt . realToFrac  <$> Tok.float         tokenParser)
  <|>     (ConstInt . fromInteger <$> Tok.integer       tokenParser)
- <?> "constVal"
+ <?> "Constant Value"
 
 constTy :: IParser ConstTy
 constTy =
         try (IntTy <$ string "Int")
     <|> try (FltTy <$ string "Float")
     <|>     (StrTy <$ string "String")
-    <?> "constTy"
+    <?> "Constant Type"
 
 typeUniverse :: IParser (PTerm Name)
 typeUniverse = lexeme (reserved "Type") *>
@@ -315,7 +309,7 @@ typedIdent :: IParser (Name, PTerm Name)
 typedIdent =
     (,) <$> lexeme identifier <*  sameOrIndented (lexeme (char ':'))
                               <*> sameOrIndented (lexeme  parseExpr)
-    <?> "typedIdent"
+    <?> "Typed identifier"
 
 -----------------------------
 -- Data declaration parser --
@@ -329,7 +323,8 @@ parseDataDecl = do
 
     constrs <- map (id *** TyDecl (DataCon 0)) <$> block (typedIdent)
 
-    return . MkContext . M.fromList $ (tyName, TyDecl (TypeCon 0) ty) : constrs
+    return . MkContext . M.fromList $
+        (tyName, TyDecl (TypeCon 0) ty) : constrs
 
 -------------------
 -- Second Parser --
@@ -347,7 +342,7 @@ parseCoqDef = do
     -- Definition name.
     name <- lexeme identifier
     -- Typed, named args.
-    args <- many (parens typedIdent)
+    args <- many . lexeme $ parens typedIdent
 
     lexeme (reservedOp ":")
 
@@ -437,20 +432,3 @@ infixr 5 <++>
 parsef p t s =
     let Right x = iparse p t s
     in x
-
---
-
-testParseC = do
-    npc@(MkContext npcm) <- newParseC
-    let val = head $ M.toList npcm
-    case val of
-        (_, Function _ term) -> return $ substCtx term npc
-        _ -> undefined
---    return . head $ M.toList npcm
-
-newParseC = parsedCtxToCore [] newParse
-
-newParse = parsef (allOf parseContext') "newParse" $
-    "id (A : Type) (a : A) : A := a\n" ++
-    "const (A : Type) (B : Type) (a : A) (b : B) : B := b\n" ++
-    "aVal : Int := id _ (const _ _ 13.2 100)"
