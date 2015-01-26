@@ -14,10 +14,14 @@ import Term
 import Parser
 import Tactic hiding (normalize)
 
+replSettings :: Settings IO
+replSettings =
+    defaultSettings {
+        historyFile = Just "/home/fiendfan1/.russel_history"
+    }
+
 replIO :: Context (PTerm Name) -> IO ()
-replIO pctx = runInputT
-    defaultSettings{historyFile = Just "/home/fiendfan1/.russel_history"}
-    (repl pctx)
+replIO pctx = runInputT replSettings (repl pctx)
 
 repl :: Context (PTerm Name) -> InputT IO ()
 repl pctx = do

@@ -30,7 +30,7 @@ data Term n =
   deriving (Show, Functor)
 
 instance Pretty n => Pretty (Term n) where
-    pPrint (Var _ n _ty) = pPrint n -- <> " : " <> pPrint ty
+    pPrint (Var _ n ty) = "(" <> pPrint n <> " : " <> pPrint ty <> ")"
     pPrint (App f x) = "(" <> pPrint f <> " " <> pPrint x <> ")"
     pPrint (Bind n (Lam ty) b) =
         "(" <>

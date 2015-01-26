@@ -26,18 +26,25 @@ data ProofState = ProofState {
     proofType    :: Term Name,
     -- ^ Original goal
     proofHoles   :: [Name],
+    unified      :: (Name, [(Name, Term Name)]),
     unsolved     :: [(Env, (Term Name, Term Name))],
     proofContext :: Context (Term Name),
     psNameSeed   :: Int
     } deriving (Show, Eq)
 
 instance Pretty ProofState where
-    pPrint (ProofState n tm ty hs prob _ctx _) =
+    pPrint (ProofState n tm ty hs (un, unif) prob _ctx _) =
         "==== " <> pPrint n <> " ====\n" <>
         pPrint tm <> "\n== Goal ==\n" <> pPrint ty <>
         "\n== Holes ==\n" <> "[" <> printHoles hs <> "]" <>
+        "\n== Unified ==\n" <> pPrint un <> "\n" <> printUnified unif <>
         "\n== Problems ==\n" <> printProbs prob
       where
+        printUnified ((n',t) : xs) =
+            pPrint n' <> " ~=~ " <> pPrint t <> "\n" <>
+            printUnified xs
+        printUnified [] = ""
+
         printHoles (x : y : xs) = pPrint x <> ", " <> printHoles (y : xs)
         printHoles [x]          = pPrint x
         printHoles []           = ""
@@ -84,12 +91,14 @@ getName str = do
     i <- nameSeed
     return $ IName i str
 
-focus :: Name -> Elab ()
-focus n = modify $ \ps ->
-    let hs = proofHoles ps
-    in if n `elem` hs
-        then ps{proofHoles = n : (hs \\ [n])}
-        else ps
+focus :: Name -> Tactic
+focus n _ _ t = do
+    modify $ \ps ->
+        let hs = proofHoles ps
+        in if n `elem` hs
+            then ps{proofHoles = n : (hs \\ [n])}
+            else ps
+    return t
 
 unfocus :: Elab ()
 unfocus = modify $ \ps ->
@@ -125,7 +134,7 @@ newProof n ctx ty =
     in ProofState n
         (ProofTerm (Bind h (Hole ty) (Var Bound h ty)) [])
         ty
-        [h] [] ctx 1
+        [h] ("asdf",[]) [] ctx 1
 
 check :: Env -> Term Name -> Elab (Term Name)
 check env term = do
@@ -149,8 +158,20 @@ normalize term = return $ T.normalize term
 --    ctx <- gets proofContext
 --    return $ substCtx ctx (T.normalize term)
 
-subst :: Name -> Term Name -> Elab ()
-subst n term = modify $ \ps ->
+subst :: Name -> Term Name -> Tactic
+subst n val _ _ term = do
+    -- XXX?
+    modify $ \ps -> ps{proofHoles = (proofHoles ps) \\ [n]}
+
+    -- XXX?
+    modify $ \ps ->
+        let ProofTerm pt env = proofTerm ps
+            env' = map (second $ fmap (T.subst n val)) env
+        in ps{proofTerm = ProofTerm pt env'}
+
+    let term'  = T.subst n val term
+    return term'
+{- modify $ \ps ->
     let ProofTerm pt env  = proofTerm ps
         pt'  = T.subst n term pt
         env' = map (second $ fmap (T.subst n term)) env
@@ -158,6 +179,7 @@ subst n term = modify $ \ps ->
         hs   = proofHoles ps
         hs'  = hs \\ [n]
     in ps{proofTerm = ProofTerm pt' env', proofHoles = hs'}
+-}
 
 substProblems :: Name -> Term Name -> Elab ()
 substProblems n term = modify $ \ps ->
@@ -199,7 +221,9 @@ solve _ _ (Bind n (Guess _ val) e)
     | pureTerm val = do
         removeHole (Just n)
         return $ T.subst n val e
-solve _ _ _ = lift . TypeError . Msg $ "Can't solve here."
+solve _ _ _ = do
+    traceState
+    lift . TypeError . Msg $ "Can't solve here."
 
 attack :: Tactic
 attack _ _ (Bind n (Hole ty) s) = do
@@ -211,11 +235,15 @@ attack _ _ (Bind n (Hole ty) s) = do
 attack _ _ _ = lift . TypeError . Msg $ "Not an attackable hole."
 
 try :: Tactic -> Tactic -> Tactic
-try t1 t2 env ctx term = do
+try t1 t2 env ctx term =
+    tryE (t1 env ctx term) (t2 env ctx term)
+
+tryE :: Elab a -> Elab a -> Elab a
+tryE e1 e2 = do
     pt <- get
-    case runStateT (t1 env ctx term) pt of
+    case runStateT e1 pt of
         PassCheck (x, st) -> put st >> return x
-        TypeError _  -> t2 env ctx term
+        TypeError _       -> e2
 
 tacticN :: Tactic -> Elab ()
 tacticN = tactic Nothing
@@ -321,9 +349,9 @@ intro mn _ _ (Bind x (Hole t) (Var _ x' _)) | x == x' =
             _ -> whnf t  -- TODO should be hnf, not whnf
     in case t' of
         Bind y (Pi s) tt ->
-            let t'' = T.subst y (Var Bound n s) tt
-            in return $ Bind n (Lam s) $ Bind x (Hole t'') $
-                        Var Bound x t''
+            let tt' = T.subst y (Var Bound n s) tt
+            in return $ Bind n (Lam s) $ Bind x (Hole tt') $
+                        Var Bound x tt'
         _ -> lift . TypeError . Msg $ "Can't introduce term."
 intro _ _ _ _ = lift . TypeError . Msg $ "Can't introduce here."
 
@@ -344,10 +372,12 @@ movelast n _ _ t = do
     return t
 
 prepFill :: Name -> [Name] -> Tactic
-prepFill f as _ _ (Bind n (Hole ty) e) = do
-    let val = foldr (flip App) (Var Ref f $ error "prepFill erased") $
-                map (\a -> Var Ref a $ error "prepFill erased") as
-    return $ Bind n (Guess ty val) e
+prepFill f as _ _ (Bind n (Hole ty) e) =
+    let val = foldr (flip App) (Var Ref f $ Type 0) $
+                            -- ^ XXX: The 'Type 0' should be 'Erased'
+                map (\a -> Var Ref a $ Type 0) as
+                            -- ^ XXX: The 'Type 0' should be 'Erased'
+    in return $ Bind n (Guess ty val) e
 prepFill _ _ _ _ _ = lift . TypeError . Msg $ "Can't prepare fill here."
 
 completeFill :: Tactic
@@ -357,6 +387,33 @@ completeFill env ctx b@(Bind _ (Guess ty val) _) = do
     return b
 completeFill _ _ _ = lift . TypeError . Msg $ "Can't complete fill here."
 
+endUnify :: Tactic
+endUnify _ _ term = do
+    (_h, us) <- gets unified
+--    modify $ \ps -> ps{unified = (h, [])}
+    return $ foldr (uncurry T.subst) term us
+
+dropHoles :: Elab ()
+dropHoles = do
+    pt <- gets (ptTerm . proofTerm)
+    modify $ \ps ->
+        ps{proofTerm = (proofTerm ps){ptTerm = dropHoles' pt}}
+  where
+    dropHoles' :: Term Name -> Term Name
+    dropHoles' (App f x) = App (dropHoles' f) (dropHoles' x)
+    dropHoles' (Bind n b e)
+        | isHole b =
+            let e' = dropHoles' e
+            in if n `freeIn` e'
+                then e'
+                else Bind n (fmap dropHoles' b) e'
+        | otherwise = Bind n (fmap dropHoles' b) (dropHoles' e)
+    dropHoles' tm = tm
+
+    isHole Hole{}  = True
+    isHole Guess{} = True
+    isHole _       = False
+
 -----------------
 -- Unification --
 -----------------
@@ -364,15 +421,17 @@ completeFill _ _ _ = lift . TypeError . Msg $ "Can't complete fill here."
 unify :: Env -> Term Name -> Term Name -> Elab ()
 unify env x y = do
     s <- primUnify env x y
-    mapM_ (\(n,t) -> subst n t >> substProblems n t) s
+    modify $ \ps ->
+        let (n, us) = unified ps
+        in ps{unified = (n, us ++ s)}
+    mapM_ (\(n,t) -> tacticN (subst n t) >> substProblems n t) s
     reunify
 
 reunify :: Elab ()
 reunify = do
     probs <- gets unsolved
     ss <- mapM (\(env, (x, y)) -> primUnify env x y) probs
-    mapM_ (uncurry subst) (concat ss)
---    gets unsolved
+    mapM_ (tacticN . uncurry subst) (concat ss)
 
 primUnify :: Env -> Term Name -> Term Name -> Elab [(Name, Term Name)]
 primUnify _ x y | x == y = return []
@@ -418,13 +477,15 @@ unifyBind _ _ _ = return []
 
 unifyFail :: Env -> Term Name -> Term Name -> Elab a
 unifyFail env x y = do
-    ps@(ProofState _ _ _ _ fs _ _) <- get
+    ps <- get
+    let fs = unsolved ps
     put ps{unsolved = (env, (x, y)) : fs}
     lift $ TypeError (CantUnify x y)
 
 unifyTmpFail :: Env -> Term Name -> Term Name -> Elab [(Name, Term Name)]
 unifyTmpFail env x y = do
-    ps@(ProofState _ _ _ _ fs _ _) <- get
+    ps <- get
+    let fs = unsolved ps
     put ps{unsolved = (env, (x, y)) : fs}
     return []
 
@@ -460,7 +521,7 @@ elab (PBind n (Pi tyN) e) = do
 
     tacticN $ claim xTy (Type 0)
     tacticN $ forall n (Var Bound xTy (Type 0))
-    focus xTy
+    tacticN $ focus xTy
 
     elab tyN
     elab e
@@ -477,12 +538,40 @@ elab (PLet n val e) = do
         (Var Bound xTy (Type 0))
         (Var Bound vTy (Var Bound xTy (Type 0)))
 
-    focus vTy
+    tacticN $ focus vTy
     elab val
     elab e
     tacticN solve
 elab (PBind n (Let _ val) e) =
     elab $ PLet n val e
+{-
+elab tm@PApp{} = do
+    let (f, args) = toFunc tm
+
+    argNs <- (flip mapM) args $ \arg -> do
+        tHole <- getName "argTy"
+        tacticN $ claim tHole (Type 0)
+
+        nHole <- getName "hole"
+        tacticN $ claim nHole (Var Bound tHole (Type 0))
+
+        return $ Var Bound nHole (Var Bound tHole (Type 0))
+
+    tacticN . fill $ foldr (flip App) f argNs
+{-
+
+        -- Elab arg
+        tacticN $ focus nHole
+        elab arg
+
+    tacticN solve
+-}
+  where
+    toFunc (PApp e' a') =
+        let (f, args) = toFunc e'
+        in (f, a' : args)
+    toFunc e' = (e', [])
+-}
 elab (PApp e a) = do
     aHole <- getName "argTy"
     tacticN $ claim aHole (Type 0)
@@ -499,16 +588,19 @@ elab (PApp e a) = do
     tacticN $ claim sHole (Var Bound aHole (Type 0))
 
     -- XXX: ???
---    tacticN $ prepFill fHole [sHole]
+    tacticN $ prepFill fHole [sHole]
 
-    focus fHole
+    tacticN $ focus fHole
     elab e
 
-    focus sHole
+    tacticN $ focus sHole
     elab a
 
     -- XXX: ???
---    tacticN completeFill
+    tacticN completeFill
+    tacticN endUnify
+    tacticN solve
+    dropHoles
 
     hs <- gets proofHoles
     when (aHole `elem` hs) $ tacticN (movelast aHole)
@@ -545,7 +637,7 @@ checkPiGoal n = do
             tacticN $ movelast b
             tacticN $ fill (Var Bound f fTy)
             tacticN   solve
-            focus f
+            tacticN $ focus f
 
 goal :: Elab (Binder (Term Name))
 goal = do
@@ -554,7 +646,7 @@ goal = do
         []      -> lift . TypeError . Msg $ "No holes for goal."
         (h : _) -> do
             pTy <- gets (ptTerm . proofTerm)
-            lift $ findGoal h pTy
+            findGoal h pTy
   where
     findGoal h (Bind n b@Guess{} e)
         | h == n    = return b
@@ -562,8 +654,13 @@ goal = do
     findGoal h (Bind n b@Hole{} e)
         | h == n    = return b
         | otherwise = findGoalB h b `mplus` findGoal h e
+
+    --- XXX: CORRECT?
+    findGoal h (Bind _ b e) = findGoalB h b `mplus` findGoal h e
+
     findGoal h (App f a) = findGoal h f `mplus` findGoal h a
-    findGoal h _ = TypeError . Msg $ "Can't find hole " ++ show h
+    findGoal h _ = do
+        lift . TypeError . Msg $ "Can't find hole " ++ show h
 
     findGoalB h (Let t v)   = findGoal h t `mplus` findGoal h v
     findGoalB h (Guess t v) = findGoal h t `mplus` findGoal h v
@@ -572,12 +669,42 @@ goal = do
 --- TESTING ----
 
 
+traceState :: Elab ()
+traceState =
+    get >>= flip trace (return ()) . show . pPrint
+
+
 myId :: TypeCheck Doc
-myId = fmap pPrint . execStateT mkFun . newProof "myId" mempty $
+myId = fmap pPrint . execStateT mkFun' . newProof "myId" mempty $
     Constant (ConstTy IntTy)
 {-    Bind "A" (Pi $ Type 0) .
     Bind "a" (Pi . Var Bound "A" $ Type 0) $
-    Var Bound "a" (Var Bound "A" $ Type 0) -}
+    Var Bound "a" (Var Bound "A" $ Type 0)-}
+
+mkFun' :: Elab ()
+mkFun' = do
+    idF <- getName "idFunc"
+    arg <- getName "a"
+    let intTy = Constant $ ConstTy IntTy
+
+    tacticN $ claim idF $
+        Bind arg (Pi intTy) $
+        Var Bound arg intTy
+    tacticN $ claim arg intTy
+
+    -- Create identity function
+    tacticN $ focus idF
+    tacticN   attack
+    tacticN $ intro (Just arg)
+--
+    tacticN $ fill (Var Bound arg intTy)
+    tacticN solve
+--
+    tacticN solve
+    -- Apply arg
+    tacticN $ focus arg
+    tacticN $ fill intTy
+    tacticN   solve
 
 mkFun :: Elab ()
 mkFun = do
@@ -594,15 +721,15 @@ mkFun = do
     tacticN $ claim arg2 $ Constant (ConstTy IntTy)
 
     -- Create identity function
-    focus idF
+    tacticN $ focus idF
     mkId arg1 arg2
 
     -- Apply first arg
-    focus arg1
+    tacticN $ focus arg1
     tacticN $ fill (Constant (ConstTy IntTy))
     tacticN   solve
     -- Apply second arg
-    focus arg2
+    tacticN $ focus arg2
     tacticN $ fill (Constant (ConstInt 12))
     tacticN   solve
 
@@ -618,13 +745,3 @@ mkId arg1 arg2 = do
     tacticN $ intro (Just arg2)
     tacticN $ fill (Var Bound arg2 (Var Bound arg1 (Type 0)))
     forM_ [0..(2::Int)] . const $ tacticN solve
-
-pId :: PTerm Name
-pId = PLam "A" $ PLam "a" $
-      PVar "a"
-
-testP = execStateT (elab pId) $
-    newProof "testP" mempty $
-        Bind "A" (Pi $ Type 0) $
-        Bind "a" (Pi . Var Bound "A" $ Type 0) $
-        Var Bound "a" (Var Bound "A" $ Type 0)
