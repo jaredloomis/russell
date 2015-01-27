@@ -42,9 +42,12 @@ repl pctx = do
     processParsed' ctx pterm pty = do
         lift $ putStrLn "Parsed: "
         lift $ print pterm
-        typeCheckFail (parsedToCore [] pctx pty) $ \ty ->
+        typeCheckFail (execStateT (elab pty) $
+            newProof "type of repl term" ctx (Type 0)) $ \tyPs -> do
+            let ty = ptTerm . proofTerm $ tyPs
+
             typeCheckFail (execStateT (elab pterm) $
-                           newProof "repl proof" ctx ty) $ \ps -> do
+                           newProof "repl term" ctx ty) $ \ps -> do
                 lift . print . pPrint $ ps
                 repl pctx
 

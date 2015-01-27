@@ -512,8 +512,9 @@ elab (PLam n e) = do
     tacticN   attack
     tacticN $ intro (Just n)
     elab e
-    tacticN   solve
+    tacticN solve
 elab (PBind n Lam{} e) =
+    -- TODO
     elab $ PLam n e
 elab (PBind n (Pi tyN) e) = do
     tacticN   attack
@@ -543,35 +544,60 @@ elab (PLet n val e) = do
     elab e
     tacticN solve
 elab (PBind n (Let _ val) e) =
+    -- TODO
     elab $ PLet n val e
-{-
 elab tm@PApp{} = do
+    -- Collect all args and find the base function
+    -- they are all being applied to.
     let (f, args) = toFunc tm
 
-    argNs <- (flip mapM) args $ \arg -> do
-        tHole <- getName "argTy"
-        tacticN $ claim tHole (Type 0)
+    -- Claim a name for each argument, and for each argument's type.
+    (argNames, argTyNames) <- fmap unzip . (flip mapM) args $ \_arg -> do
+        atN <- getName "argTy"
+        tacticN $ claim atN (Type 0)
 
-        nHole <- getName "hole"
-        tacticN $ claim nHole (Var Bound tHole (Type 0))
+        aN <- getName "aElab"
+        tacticN $ claim aN (Var Bound atN (Type 0))
+        return (aN, atN)
 
-        return $ Var Bound nHole (Var Bound tHole (Type 0))
+    -- Claim a name for the result type of the function.
+    -- ie, f : ... -> resultTy
+    resultTy <- getName "resTy"
+    tacticN $ claim resultTy (Type 0)
 
-    tacticN . fill $ foldr (flip App) f argNs
-{-
+    -- The complete type of the function is
+    -- 'args -> resultTy'
+    let tyFN = foldr (\x b ->
+                Bind "_" (Pi $ Var Bound x (Type 0)) b)
+            (Var Bound resultTy (Type 0))
+            argTyNames
 
-        -- Elab arg
-        tacticN $ focus nHole
-        elab arg
+    fN <- getName "fElab"
+    tacticN $ claim fN tyFN
 
+    -- Prepfill args.
+    tacticN $ prepFill fN argNames
+
+    -- Elab function.
+    tacticN $ focus fN
+    elab f
+
+    -- Elab args.
+    (flip mapM_) (zip args argNames) $ \(t, n) -> do
+        tacticN $ focus n
+        elab t
+
+    -- Cleanup. Very important.
+    tacticN completeFill
+    tacticN endUnify
     tacticN solve
--}
+    dropHoles
   where
     toFunc (PApp e' a') =
         let (f, args) = toFunc e'
         in (f, a' : args)
     toFunc e' = (e', [])
--}
+{-
 elab (PApp e a) = do
     aHole <- getName "argTy"
     tacticN $ claim aHole (Type 0)
@@ -605,6 +631,7 @@ elab (PApp e a) = do
     hs <- gets proofHoles
     when (aHole `elem` hs) $ tacticN (movelast aHole)
     when (bHole `elem` hs) $ tacticN (movelast bHole)
+-}
 elab PTypeI = do
     tacticN $ fill (Type 0)
     tacticN   solve
@@ -673,41 +700,49 @@ traceState :: Elab ()
 traceState =
     get >>= flip trace (return ()) . show . pPrint
 
-
 myId :: TypeCheck Doc
-myId = fmap pPrint . execStateT mkFun' . newProof "myId" mempty $
+myId = fmap pPrint . execStateT mkFun . newProof "myId" mempty $
     Constant (ConstTy IntTy)
 {-    Bind "A" (Pi $ Type 0) .
     Bind "a" (Pi . Var Bound "A" $ Type 0) $
     Var Bound "a" (Var Bound "A" $ Type 0)-}
 
-mkFun' :: Elab ()
-mkFun' = do
-    idF <- getName "idFunc"
-    arg <- getName "a"
-    let intTy = Constant $ ConstTy IntTy
-
-    tacticN $ claim idF $
-        Bind arg (Pi intTy) $
-        Var Bound arg intTy
-    tacticN $ claim arg intTy
-
-    -- Create identity function
-    tacticN $ focus idF
-    tacticN   attack
-    tacticN $ intro (Just arg)
---
-    tacticN $ fill (Var Bound arg intTy)
-    tacticN solve
---
-    tacticN solve
-    -- Apply arg
-    tacticN $ focus arg
-    tacticN $ fill intTy
-    tacticN   solve
-
 mkFun :: Elab ()
 mkFun = do
+{-
+    aHole <- getName "argTy"
+    tacticN $ claim aHole (Type 0)
+
+    bHole <- getName "retTy"
+    tacticN $ claim bHole (Type 0)
+
+    fHole <- getName "fElab"
+    tacticN $ claim fHole $
+        Bind "aXElab" (Pi $ Var Bound aHole (Type 0))
+                 (Var Bound bHole (Type 0))
+
+    sHole <- getName "sElab"
+    tacticN $ claim sHole (Var Bound aHole (Type 0))
+
+    -- XXX: ???
+    tacticN $ prepFill fHole [sHole]
+
+    tacticN $ focus fHole
+    mkId 
+
+    tacticN $ focus sHole
+    elab a
+
+    -- XXX: ???
+    tacticN completeFill
+    tacticN endUnify
+    tacticN solve
+    dropHoles
+
+    hs <- gets proofHoles
+    when (aHole `elem` hs) $ tacticN (movelast aHole)
+    when (bHole `elem` hs) $ tacticN (movelast bHole)
+-}
     -- Create holes
     idF <- getName "idFunc"
     arg1 <- getName "A"
@@ -719,6 +754,8 @@ mkFun = do
         Var Bound arg2 (Var Bound arg1 $ Type 0)
     tacticN $ claim arg1 $ Type 0
     tacticN $ claim arg2 $ Constant (ConstTy IntTy)
+
+    tacticN $ prepFill idF [arg1, arg2]
 
     -- Create identity function
     tacticN $ focus idF
@@ -732,6 +769,13 @@ mkFun = do
     tacticN $ focus arg2
     tacticN $ fill (Constant (ConstInt 12))
     tacticN   solve
+
+    -- XXX: ???
+--    tacticN completeFill
+    tacticN endUnify
+    tacticN solve
+    dropHoles
+
 
 -- WHY NECESSARY
 --    tacticN $ fill (Constant (ConstInt 12))
