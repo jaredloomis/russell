@@ -500,9 +500,9 @@ subst ni ei = go
             Bind n (Let (go ty) (go val))
                    (go (subst n (Var Bound n ty) b))
     go   (App f a)            = App (go f) (go a)
-    go e@(Var _ n _)
+    go (Var nt n ty)
         | n == ni             = ei
-        | otherwise           = e
+        | otherwise           = Var nt n (go ty)
     go c@Constant{}           = c
     go t@Type{}               = t
 

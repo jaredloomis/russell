@@ -212,6 +212,11 @@ claim n ty _ _ term = do
 fill :: Term Name -> Tactic
 fill guess env ctx (Bind n (Hole ty) e) = do
     tyG <- lift $ typeOf env ctx guess
+    trace
+        ("\n\nwasabi\n\ntyG: " ++
+        show (pPrint tyG) ++
+        "\nty: " ++ show (pPrint ty)
+        ++ "\n\nwasabi\n\n") (return ())
     unify env ty tyG
     return $ Bind n (Guess ty guess) e
 fill _ _ _ _ = lift . TypeError . Msg $ "Can't fill here."
@@ -439,12 +444,27 @@ primUnify _ Type{} Type{} = return []
 primUnify env cx@(Constant x) cy@(Constant y)
     | x == y    = return []
     | otherwise = unifyTmpFail env cx cy
+--
+primUnify env a@(Var _ n ty) b
+    | pureTerm b && isHoleIn env n = do
+        s <- (flip tryE) (return []) $ do
+            ctx <- gets proofContext
+            tyB <- lift $ typeOf env ctx b
+            primUnify env ty tyB
+        return $ composeSubst [(n, b)] s
+    | otherwise = unifyTmpFail env a b
+primUnify env a b@(Var _ n _)
+    | pureTerm a && isHoleIn env n = return [(n, a)]
+    | otherwise = unifyTmpFail env a b
+--
+{-
 primUnify env a@(Var _ n _) b
     | pureTerm b && isHoleIn env n = return [(n, b)]
     | otherwise = unifyTmpFail env a b
 primUnify env a b@(Var _ n _)
     | pureTerm a && isHoleIn env n = return [(n, a)]
     | otherwise = unifyTmpFail env a b
+-}
 primUnify env a@(Bind _ Hole{} _) b = unifyTmpFail env a b
 primUnify env a b@(Bind _ Hole{} _) = unifyTmpFail env a b
 primUnify env (Bind _ ba aa) (Bind _ bb ab)
@@ -570,7 +590,7 @@ elab tm@PApp{} = do
     let tyFN = foldr (\x b ->
                 Bind "_" (Pi $ Var Bound x (Type 0)) b)
             (Var Bound resultTy (Type 0))
-            argTyNames
+            (reverse argTyNames)
 
     fN <- getName "fElab"
     tacticN $ claim fN tyFN
